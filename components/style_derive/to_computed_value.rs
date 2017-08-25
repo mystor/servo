@@ -6,21 +6,14 @@ use quote;
 use syn;
 use synstructure;
 
-pub fn derive(input: syn::DeriveInput) -> quote::Tokens {
-    let name = &input.ident;
-    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
-    let mut where_clause = where_clause.clone();
-    for param in &input.generics.ty_params {
-        where_clause.predicates.push(where_predicate(syn::Ty::Path(None, param.ident.clone().into()), None));
-    }
-
+pub fn derive(input: synstructure::Structure) -> quote::Tokens {
     let computed_value_type = syn::Path::from(syn::PathSegment {
-        ident: name.clone(),
+        ident: input.ast().ident.clone(),
         parameters: syn::PathParameters::AngleBracketed(syn::AngleBracketedParameterData {
-            lifetimes: input.generics.lifetimes.iter().map(|l| {
+            lifetimes: input.ast().generics.lifetimes.iter().map(|l| {
                 l.lifetime.clone()
             }).collect(),
-            types: input.generics.ty_params.iter().map(|ty| {
+            types: input.ast().generics.ty_params.iter().map(|ty| {
                 syn::Ty::Path(
                     Some(syn::QSelf {
                         ty: Box::new(syn::Ty::Path(None, ty.ident.clone().into())),
@@ -48,95 +41,111 @@ pub fn derive(input: syn::DeriveInput) -> quote::Tokens {
         quote!(::values::computed::ToComputedValue::from_computed_value(#field))
     });
 
-    quote! {
-        impl #impl_generics ::values::computed::ToComputedValue for #name #ty_generics #where_clause {
-            type ComputedValue = #computed_value_type;
+    input.bound_impl("::values::computed::ToComputedValue", quote! {
+        type ComputedValue = #computed_value_type;
 
-            #[allow(unused_variables)]
-            #[inline]
-            fn to_computed_value(&self, context: &::values::computed::Context) -> Self::ComputedValue {
-                match *self {
-                    #to_body
-                }
-            }
-
-            #[inline]
-            fn from_computed_value(computed: &Self::ComputedValue) -> Self {
-                match *computed {
-                    #from_body
-                }
+        #[allow(unused_variables)]
+        #[inline]
+        fn to_computed_value(&self, context: &::values::computed::Context) -> Self::ComputedValue {
+            match *self {
+                #to_body
             }
         }
-    }
+
+        #[inline]
+        fn from_computed_value(computed: &Self::ComputedValue) -> Self {
+            match *computed {
+                #from_body
+            }
+        }
+    })
 }
 
-fn match_body<F>(input: &syn::DeriveInput, f: F) -> quote::Tokens
+fn match_body<F>(input: &synstructure::Structure, f: F) -> quote::Tokens
     where F: Fn(&synstructure::BindingInfo) -> quote::Tokens,
 {
-    let by_ref = synstructure::BindStyle::Ref.into();
-    let by_value = synstructure::BindStyle::Move.into();
-
-    synstructure::each_variant(&input, &by_ref, |fields, variant| {
-        let name = if let syn::Body::Enum(_) = input.body {
-            format!("{}::{}", input.ident, variant.ident).into()
-        } else {
-            variant.ident.clone()
-        };
-        let (computed_value, computed_fields) = synstructure::match_pattern(&name, &variant.data, &by_value);
-        let fields_pairs = fields.iter().zip(computed_fields.iter());
+    input.each_variant(|v| {
         let mut computations = quote!();
-        computations.append_all(fields_pairs.map(|(field, computed_field)| {
-            let expr = f(field);
-            quote!(let #computed_field = #expr;)
+        computations.append_all(v.bindings().iter().map(|bi| {
+            let expr = f(bi);
+            quote!(let #bi = #expr;)
         }));
-        Some(quote!(
+
+        // NOTE: Abuse? Abuse the fact that move patterns are symmetrical to
+        // construction patterns, to perform a transformation on each element,
+        // and then re-construct the resulting value.
+        // XXX: Add a tool for doing this to synstructure?
+        let mut move_variant = v.clone();
+        move_variant.bind_with(|_| synstructure::BindStyle::Move);
+        let computed_value = move_variant.pat();
+        quote! {
             #computations
             #computed_value
-        ))
-    })
-}
-
-/// `#ty: ::values::computed::ToComputedValue<ComputedValue = #computed_value,>`
-fn where_predicate(ty: syn::Ty, computed_value: Option<syn::Ty>) -> syn::WherePredicate {
-    syn::WherePredicate::BoundPredicate(syn::WhereBoundPredicate {
-        bound_lifetimes: vec![],
-        bounded_ty: ty,
-        bounds: vec![syn::TyParamBound::Trait(
-            syn::PolyTraitRef {
-                bound_lifetimes: vec![],
-                trait_ref: trait_ref(computed_value),
-            },
-            syn::TraitBoundModifier::None
-        )],
-    })
-}
-
-/// `::values::computed::ToComputedValue<ComputedValue = #computed_value,>`
-fn trait_ref(computed_value: Option<syn::Ty>) -> syn::Path {
-    syn::Path {
-        global: true,
-        segments: vec![
-            "values".into(),
-            "computed".into(),
-            syn::PathSegment {
-                ident: "ToComputedValue".into(),
-                parameters: syn::PathParameters::AngleBracketed(
-                    syn::AngleBracketedParameterData {
-                        bindings: trait_bindings(computed_value),
-                        .. Default::default()
-                    }
-                ),
-            }
-        ],
-    }
-}
-
-/// `ComputedValue = #computed_value,`
-fn trait_bindings(computed_value: Option<syn::Ty>) -> Vec<syn::TypeBinding> {
-    computed_value.into_iter().map(|ty| {
-        syn::TypeBinding {
-            ident: "ComputedValue".into(),
-            ty: ty,
         }
-    }).collect()
+    })
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn simple() {
+        test_derive! {
+            super::derive {
+                struct A<T> {
+                    a: T,
+                    b: Option<T>,
+                }
+            }
+            expands to {
+                impl<T> ::values::computed::ToComputedValue for A<T>
+                where
+                    T: ::values::computed::ToComputedValue
+                {
+                    type ComputedValue = A<
+                        <T as ::values::computed::ToComputedValue>::ComputedValue
+                    >;
+
+                    #[allow(unused_variables)]
+                    #[inline]
+                    fn to_computed_value(
+                        &self,
+                        context: &::values::computed::Context
+                    ) -> Self::ComputedValue {
+                        match *self {
+                            A { a: ref __binding_0, b: ref __binding_1, } => {
+                                let __binding_0 =
+                                    ::values::computed::ToComputedValue::to_computed_value(
+                                        __binding_0,
+                                        context
+                                    );
+                                let __binding_1 =
+                                    ::values::computed::ToComputedValue::to_computed_value(
+                                        __binding_1,
+                                        context
+                                    );
+                                A { a: __binding_0, b: __binding_1, }
+                            }
+                        }
+                    }
+
+                    #[inline]
+                    fn from_computed_value(computed: &Self::ComputedValue) -> Self {
+                        match *computed {
+                            A { a: ref __binding_0, b: ref __binding_1, } => {
+                                let __binding_0 =
+                                    ::values::computed::ToComputedValue::from_computed_value(
+                                        __binding_0
+                                    );
+                                let __binding_1 =
+                                    ::values::computed::ToComputedValue::from_computed_value(
+                                        __binding_1
+                                    );
+                                A { a: __binding_0, b: __binding_1, }
+                            }
+                        }
+                    }
+                }
+            } no_build
+        }
+    }
 }

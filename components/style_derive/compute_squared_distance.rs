@@ -3,115 +3,133 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use quote;
-use std::borrow::Cow;
-use syn;
 use synstructure;
 
-pub fn derive(input: syn::DeriveInput) -> quote::Tokens {
-    let name = &input.ident;
-    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
-    let mut where_clause = where_clause.clone();
-    for param in &input.generics.ty_params {
-        where_clause.predicates.push(where_predicate(syn::Ty::Path(None, param.ident.clone().into())))
-    }
-
-    let variants = variants(&input);
+pub fn derive(mut input: synstructure::Structure) -> quote::Tokens {
     let mut match_body = quote!();
-    match_body.append_all(variants.iter().map(|variant| {
-        let name = match input.body {
-            syn::Body::Struct(_) => Cow::Borrowed(&input.ident),
-            syn::Body::Enum(_) => {
-                Cow::Owned(syn::Ident::from(format!("{}::{}", input.ident, variant.ident)))
-            },
-        };
-        let (this_pattern, this_info) = synstructure::match_pattern(
-            &name,
-            &variant.data,
-            &synstructure::BindOpts::with_prefix(
-                synstructure::BindStyle::Ref,
-                "this".to_owned(),
-            ),
-        );
-        let (other_pattern, other_info) = synstructure::match_pattern(
-            &name,
-            &variant.data,
-            &synstructure::BindOpts::with_prefix(
-                synstructure::BindStyle::Ref,
-                "other".to_owned(),
-            ),
-        );
-        let sum = if this_info.is_empty() {
+    match_body.append_all(input.variants_mut().iter_mut().map(|variant| {
+        // Make another copy of the variant to match against `other` with.
+        let mut other_variant = variant.clone();
+        other_variant.binding_name(|_, i| format!("other_{}", i).into());
+
+        // Generate the body of the expression.
+        let sum = if variant.bindings().is_empty() {
             quote! { ::values::distance::SquaredDistance::Value(0.) }
         } else {
             let mut sum = quote!();
-            sum.append_separated(this_info.iter().zip(&other_info).map(|(this, other)| {
-                where_clause.predicates.push(where_predicate(this.field.ty.clone()));
-                quote! {
-                    ::values::distance::ComputeSquaredDistance::compute_squared_distance(#this, #other)?
-                }
-            }), "+");
+            sum.append_separated(
+                variant.bindings()
+                    .iter()
+                    .zip(other_variant.bindings())
+                    .map(|(this, other)| {
+                        quote! {
+                            ::values::distance::ComputeSquaredDistance::compute_squared_distance(
+                                #this,
+                                #other,
+                            )?
+                        }
+                    }),
+                "+"
+            );
             sum
         };
+
+        // Generate the match arm.
+        let this_pat = variant.pat();
+        let other_pat = other_variant.pat();
         quote! {
-            (&#this_pattern, &#other_pattern) => {
+            (&#this_pat, &#other_pat) => {
                 Ok(#sum)
             }
         }
     }));
 
-    if variants.len() > 1 {
+    if input.variants().len() > 1 {
         match_body = quote! { #match_body, _ => Err(()), };
     }
 
-    quote! {
-        impl #impl_generics ::values::distance::ComputeSquaredDistance for #name #ty_generics #where_clause {
-            #[allow(unused_variables, unused_imports)]
-            #[inline]
-            fn compute_squared_distance(
-                &self,
-                other: &Self,
-            ) -> Result<::values::distance::SquaredDistance, ()> {
-                match (self, other) {
-                    #match_body
-                }
+    // XXX: I think we might need to add more bounds? The original code added a
+    // bound for the type of each field.
+    input.bound_impl("::values::distance::ComputeSquaredDistance", quote! {
+        #[allow(unused_variables, unused_imports)]
+        #[inline]
+        fn compute_squared_distance(
+            &self,
+            other: &Self,
+        ) -> Result<::values::distance::SquaredDistance, ()> {
+            match (self, other) {
+                #match_body
             }
         }
-    }
+    })
 }
 
-fn variants(input: &syn::DeriveInput) -> Cow<[syn::Variant]> {
-    match input.body {
-        syn::Body::Enum(ref variants) => (&**variants).into(),
-        syn::Body::Struct(ref data) => {
-            vec![syn::Variant {
-                ident: input.ident.clone(),
-                attrs: input.attrs.clone(),
-                data: data.clone(),
-                discriminant: None,
-            }].into()
-        },
+#[cfg(test)]
+mod test {
+    #[test]
+    fn simple() {
+        test_derive! {
+            super::derive {
+                struct A<T> {
+                    a: T,
+                    b: Option<T>,
+                }
+            }
+            expands to {
+                impl<T> ::values::distance::ComputeSquaredDistance for A<T>
+                where
+                    T: ::values::distance::ComputeSquaredDistance
+                {
+                    #[allow(unused_variables, unused_imports)]
+                    #[inline]
+                    fn compute_squared_distance(
+                        &self,
+                        other: &Self,
+                    ) -> Result<::values::distance::SquaredDistance, ()> {
+                        match (self, other) {
+                            (
+                                &A { a: ref __binding_0, b: ref __binding_1, },
+                                &A { a: ref other_0, b: ref other_1, }
+                            ) => {
+                                Ok(
+                                    ::values::distance::ComputeSquaredDistance::compute_squared_distance(
+                                        __binding_0,
+                                        other_0,
+                                    )? + ::values::distance::ComputeSquaredDistance::compute_squared_distance(
+                                        __binding_1,
+                                        other_1,
+                                    )?
+                                )
+                            }
+                        }
+                    }
+                }
+            } no_build
+        }
     }
-}
 
-fn where_predicate(ty: syn::Ty) -> syn::WherePredicate {
-    syn::WherePredicate::BoundPredicate(
-        syn::WhereBoundPredicate {
-            bound_lifetimes: vec![],
-            bounded_ty: ty,
-            bounds: vec![syn::TyParamBound::Trait(
-                syn::PolyTraitRef {
-                    bound_lifetimes: vec![],
-                    trait_ref: syn::Path {
-                        global: true,
-                        segments: vec![
-                            "values".into(),
-                            "distance".into(),
-                            "ComputeSquaredDistance".into(),
-                        ],
-                    },
-                },
-                syn::TraitBoundModifier::None,
-            )],
-        },
-    )
+    #[test]
+    fn empty_variant() {
+        test_derive! {
+            super::derive {
+                struct A;
+            }
+            expands to {
+                impl ::values::distance::ComputeSquaredDistance for A {
+                    #[allow(unused_variables, unused_imports)]
+                    #[inline]
+                    fn compute_squared_distance(
+                        &self,
+                        other: &Self,
+                    ) -> Result<::values::distance::SquaredDistance, ()> {
+                        match (self, other) {
+                            (&A, &A) => {
+                                Ok(::values::distance::SquaredDistance::Value(0.))
+                            }
+                        }
+                    }
+                }
+            } no_build
+        }
+    }
 }

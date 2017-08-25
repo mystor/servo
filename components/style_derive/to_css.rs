@@ -6,18 +6,10 @@ use quote;
 use syn;
 use synstructure;
 
-pub fn derive(input: syn::DeriveInput) -> quote::Tokens {
-    let name = &input.ident;
-    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
-    let mut where_clause = where_clause.clone();
-    for param in &input.generics.ty_params {
-        where_clause.predicates.push(where_predicate(syn::Ty::Path(None, param.ident.clone().into())))
-    }
-
-    let style = synstructure::BindStyle::Ref.into();
-    let match_body = synstructure::each_variant(&input, &style, |bindings, variant| {
-        let mut identifier = to_css_identifier(variant.ident.as_ref());
-        let mut css_attrs = variant.attrs.iter().filter(|attr| attr.name() == "css");
+pub fn derive(input: synstructure::Structure) -> quote::Tokens {
+    let match_body = input.each_variant(|v| {
+        let mut identifier = to_css_identifier(v.ast().ident.as_ref());
+        let mut css_attrs = v.ast().attrs.iter().filter(|attr| attr.name() == "css");
         let (is_function, use_comma) = css_attrs.next().map_or((false, false), |attr| {
             match attr.value {
                 syn::MetaItem::List(ref ident, ref items) if ident.as_ref() == "css" => {
@@ -58,12 +50,9 @@ pub fn derive(input: syn::DeriveInput) -> quote::Tokens {
             panic!("only a single `#[css(...)]` attribute is supported for now");
         }
         let separator = if use_comma { ", " } else { " " };
-        let mut expr = if !bindings.is_empty() {
+        let mut expr = if !v.bindings().is_empty() {
             let mut expr = quote! {};
-            for binding in bindings {
-                if has_free_params(&binding.field.ty, &input.generics.ty_params) {
-                    where_clause.predicates.push(where_predicate(binding.field.ty.clone()));
-                }
+            for binding in v.bindings() {
                 expr = quote! {
                     #expr
                     writer.item(#binding)?;
@@ -87,65 +76,20 @@ pub fn derive(input: syn::DeriveInput) -> quote::Tokens {
                 ::std::fmt::Write::write_str(dest, ")")
             }
         }
-        Some(expr)
+        expr
     });
 
-    quote! {
-        impl #impl_generics ::style_traits::ToCss for #name #ty_generics #where_clause {
-            #[allow(unused_variables)]
-            #[inline]
-            fn to_css<W>(&self, dest: &mut W) -> ::std::fmt::Result
+    input.bound_impl("::style_traits::ToCss", quote! {
+        #[allow(unused_variables)]
+        #[inline]
+        fn to_css<W>(&self, dest: &mut W) -> ::std::fmt::Result
             where
-                W: ::std::fmt::Write
-            {
-                match *self {
-                    #match_body
-                }
+            W: ::std::fmt::Write
+        {
+            match *self {
+                #match_body
             }
         }
-    }
-}
-
-/// Returns whether `ty` is parameterized by any parameter from `params`.
-fn has_free_params(ty: &syn::Ty, params: &[syn::TyParam]) -> bool {
-    use syn::visit::Visitor;
-
-    struct HasFreeParams<'a> {
-        params: &'a [syn::TyParam],
-        has_free: bool,
-    }
-
-    impl<'a> Visitor for HasFreeParams<'a> {
-        fn visit_path(&mut self, path: &syn::Path) {
-            if !path.global && path.segments.len() == 1 {
-                if self.params.iter().any(|param| param.ident == path.segments[0].ident) {
-                    self.has_free = true;
-                }
-            }
-            syn::visit::walk_path(self, path);
-        }
-    }
-
-    let mut visitor = HasFreeParams { params: params, has_free: false };
-    visitor.visit_ty(ty);
-    visitor.has_free
-}
-
-/// `#ty: ::style_traits::ToCss`
-fn where_predicate(ty: syn::Ty) -> syn::WherePredicate {
-    syn::WherePredicate::BoundPredicate(syn::WhereBoundPredicate {
-        bound_lifetimes: vec![],
-        bounded_ty: ty,
-        bounds: vec![syn::TyParamBound::Trait(
-            syn::PolyTraitRef {
-                bound_lifetimes: vec![],
-                trait_ref: syn::Path {
-                    global: true,
-                    segments: vec!["style_traits".into(), "ToCss".into()],
-                },
-            },
-            syn::TraitBoundModifier::None
-        )],
     })
 }
 
@@ -185,4 +129,151 @@ fn split_camel_segment<'input>(camel_case: &mut &'input str) -> Option<&'input s
     let result = &camel_case[..end_position];
     *camel_case = &camel_case[end_position..];
     Some(result)
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn simple() {
+        test_derive! {
+            super::derive {
+                enum A<T> {
+                    SomeThing(T, Option<T>),
+                    UnitVariant,
+                    MozUnitVariant,
+                    WebkitUnitVariant,
+                    #[css(function)]
+                    FuncThing(T, Option<T>),
+                    #[css(function, comma)]
+                    FuncCommaThing(T, Option<T>),
+                }
+            }
+            expands to {
+                impl<T> ::style_traits::ToCss for A<T>
+                where
+                    T: ::style_traits::ToCss
+                {
+                    #[allow(unused_variables)]
+                    #[inline]
+                    fn to_css<W>(&self, dest: &mut W) -> ::std::fmt::Result
+                    where
+                        W: ::std::fmt::Write
+                    {
+                        match *self {
+                            A::SomeThing(ref __binding_0, ref __binding_1,) => {
+                                {
+                                    let mut writer = ::style_traits::values::SequenceWriter::new(
+                                        &mut *dest,
+                                        " "
+                                    );
+                                    writer.item(__binding_0)?;
+                                    writer.item(__binding_1)?;
+                                    Ok(())
+                                }
+                            }
+                            A::UnitVariant => {
+                                ::std::fmt::Write::write_str(dest, "unit-variant")
+                            }
+                            A::MozUnitVariant => {
+                                ::std::fmt::Write::write_str(dest, "-moz-unit-variant")
+                            }
+                            A::WebkitUnitVariant => {
+                                ::std::fmt::Write::write_str(dest, "-webkit-unit-variant")
+                            }
+                            A::FuncThing(ref __binding_0, ref __binding_1,) => {
+                                ::std::fmt::Write::write_str(dest, "func-thing(")?;
+                                {
+                                    let mut writer = ::style_traits::values::SequenceWriter::new(
+                                        &mut *dest,
+                                        " "
+                                    );
+                                    writer.item(__binding_0)?;
+                                    writer.item(__binding_1)?;
+                                    Ok(())
+                                }?;
+                                ::std::fmt::Write::write_str(dest, ")")
+                            }
+                            A::FuncCommaThing(ref __binding_0, ref __binding_1,) => {
+                                ::std::fmt::Write::write_str(dest, "func-comma-thing(")?;
+                                {
+                                    let mut writer = ::style_traits::values::SequenceWriter::new(
+                                        &mut *dest,
+                                        ", "
+                                    );
+                                    writer.item(__binding_0)?;
+                                    writer.item(__binding_1)?;
+                                    Ok(())
+                                }?;
+                                ::std::fmt::Write::write_str(dest, ")")
+                            }
+                        }
+                    }
+                }
+            } no_build
+        }
+    }
+
+    #[test]
+    fn single_function_struct() {
+        test_derive! {
+            super::derive {
+                #[css(function)]
+                struct FuncThing<T>(T, Option<T>);
+            }
+            expands to {
+                impl<T> ::style_traits::ToCss for FuncThing<T>
+                where
+                    T: ::style_traits::ToCss
+                {
+                    #[allow(unused_variables)]
+                    #[inline]
+                    fn to_css<W>(&self, dest: &mut W) -> ::std::fmt::Result
+                    where
+                        W: ::std::fmt::Write
+                    {
+                        match *self {
+                            FuncThing(ref __binding_0, ref __binding_1,) => {
+                                ::std::fmt::Write::write_str(dest, "func-thing(")?;
+                                {
+                                    let mut writer = ::style_traits::values::SequenceWriter::new(
+                                        &mut *dest,
+                                        " "
+                                    );
+                                    writer.item(__binding_0)?;
+                                    writer.item(__binding_1)?;
+                                    Ok(())
+                                }?;
+                                ::std::fmt::Write::write_str(dest, ")")
+                            }
+                        }
+                    }
+                }
+            } no_build
+        }
+    }
+
+    #[test]
+    fn empty_struct() {
+        test_derive! {
+            super::derive {
+                struct MozThing;
+            }
+            expands to {
+                impl ::style_traits::ToCss for MozThing {
+                    #[allow(unused_variables)]
+                    #[inline]
+                    fn to_css<W>(&self, dest: &mut W) -> ::std::fmt::Result
+                    where
+                        W: ::std::fmt::Write
+                    {
+                        match *self {
+                            MozThing => {
+                                ::std::fmt::Write::write_str(dest, "-moz-thing")
+                            }
+                        }
+                    }
+                }
+            } no_build
+        }
+    }
 }

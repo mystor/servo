@@ -3,54 +3,56 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use quote;
-use syn;
 use synstructure;
 
-pub fn derive(input: syn::DeriveInput) -> quote::Tokens {
-    let name = &input.ident;
-    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
-    let mut where_clause = where_clause.clone();
-    for param in &input.generics.ty_params {
-        where_clause.predicates.push(where_predicate(syn::Ty::Path(None, param.ident.clone().into())))
-    }
-
-    let style = synstructure::BindStyle::Ref.into();
-    let match_body = synstructure::each_variant(&input, &style, |bindings, _| {
-        let (first, rest) = match bindings.split_first() {
-            None => return Some(quote!(false)),
-            Some(pair) => pair,
-        };
-        let mut expr = quote!(::style_traits::HasViewportPercentage::has_viewport_percentage(#first));
-        for binding in rest {
-            where_clause.predicates.push(where_predicate(binding.field.ty.clone()));
-            expr = quote!(#expr || ::style_traits::HasViewportPercentage::has_viewport_percentage(#binding));
-        }
-        Some(expr)
+pub fn derive(input: synstructure::Structure) -> quote::Tokens {
+    let body = input.fold(false, |acc, bi| {
+        quote!(#acc || ::style_traits::HasViewportPercentage::has_viewport_percentage(#bi))
     });
-
-    quote! {
-        impl #impl_generics ::style_traits::HasViewportPercentage for #name #ty_generics #where_clause {
-            #[allow(unused_variables, unused_imports)]
-            #[inline]
-            fn has_viewport_percentage(&self) -> bool {
-                match *self {
-                    #match_body
-                }
+    input.bound_impl("::style_traits::HasViewportPercentage", quote! {
+        #[allow(unused_variables, unused_imports)]
+        #[inline]
+        fn has_viewport_percentage(&self) -> bool {
+            match *self {
+                #body
             }
         }
+    })
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn simple() {
+        test_derive! {
+            super::derive {
+                struct A<T> {
+                    a: T,
+                    b: Option<T>,
+                }
+            }
+            expands to {
+                impl<T> ::style_traits::HasViewportPercentage for A<T>
+                where
+                    T: ::style_traits::HasViewportPercentage
+                {
+                    #[allow(unused_variables, unused_imports)]
+                    #[inline]
+                    fn has_viewport_percentage(&self) -> bool {
+                        match *self {
+                            A {
+                                a: ref __binding_0,
+                                b: ref __binding_1,
+                            } => {
+                                false ||
+                                    ::style_traits::HasViewportPercentage::has_viewport_percentage(__binding_0) ||
+                                    ::style_traits::HasViewportPercentage::has_viewport_percentage(__binding_1)
+                            }
+                        }
+                    }
+                }
+            } no_build
+        }
     }
 }
 
-fn where_predicate(ty: syn::Ty) -> syn::WherePredicate {
-    syn::WherePredicate::BoundPredicate(syn::WhereBoundPredicate {
-        bound_lifetimes: vec![],
-        bounded_ty: ty,
-        bounds: vec![syn::TyParamBound::Trait(
-            syn::PolyTraitRef {
-                bound_lifetimes: vec![],
-                trait_ref: syn::parse_path("::style_traits::HasViewportPercentage").unwrap(),
-            },
-            syn::TraitBoundModifier::None
-        )],
-    })
-}
